@@ -1,0 +1,394 @@
+---
+title: "Data Science Capstone - MovieLens Report"
+subtitle: "HarvardX 125.9x Capstone Project - Part 1"
+author: "Julian Fuchs"
+date: "`r format(Sys.Date(),format='%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.pos = 'h')
+knitr::opts_chunk$set(fig.align = 'center')
+
+library(tidyverse)
+library(stringr)
+library(caret)
+library(kableExtra)
+library(recosystem)
+
+goal_rmse <- 0.86490
+```
+
+\newpage{}
+
+# Introduction
+
+## Motivation
+
+The goal of this project is to train an algorithm to predict the rating of a movie. The dataset used is the Movielens 10M dataset [[1]](https://grouplens.org/datasets/movielens/10m/). As instructed, we use a slightly modified version of the dataset, the *edx* dataset. The code for this was provided by the instructor in the course materials. The performance of our model is evaluated using the **RSME** on a course provided subset, the *final_holdout_set*. Our aim is to build a model with an RMSE < `r goal_rmse`.
+
+## The Dataset
+
+```{r dataset setup, include=FALSE, cache=TRUE}
+options(timeout = 120)
+
+dl <- "Data/ml-10M100K.zip"
+if (!file.exists(dl))
+  download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings_file <- "Data/ml-10M100K/ratings.dat"
+if (!file.exists(ratings_file))
+  unzip(dl, ratings_file)
+
+movies_file <- "Data/ml-10M100K/movies.dat"
+if (!file.exists(movies_file))
+  unzip(dl, movies_file)
+
+ratings <- as.data.frame(str_split(read_lines(ratings_file), fixed("::"), simplify = TRUE),
+                         stringsAsFactors = FALSE)
+colnames(ratings) <- c("userId", "movieId", "rating", "timestamp")
+ratings <- ratings %>%
+  mutate(userId = as.integer(userId),
+         movieId = as.integer(movieId),
+         rating = as.numeric(rating),
+         timestamp = as.integer(timestamp))
+
+movies <- as.data.frame(str_split(read_lines(movies_file), fixed("::"), simplify = TRUE),
+                        stringsAsFactors = FALSE)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- movies %>%
+  mutate(movieId = as.integer(movieId))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Final hold-out test set will be 10% of MovieLens data
+set.seed(1, sample.kind = "Rounding") # if using R 3.6 or later
+# set.seed(1) # if using R 3.5 or earlier
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in final hold-out test set are also in edx set
+final_holdout_test <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from final hold-out test set back into edx set
+removed <- anti_join(temp, final_holdout_test)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed, ratings_file, movies_file)
+```
+
+The Dataset contains `r nrow(edx)` observations and consists of 6 columns:
+
+-   **rating** - The value we are trying to predict. Ratings are made on a 0 to 5 star scale, with half-star increments.
+-   **userId** - anonymized user identifier
+-   **movieId** - The movie Id
+-   **timestamp** - timestamp of submission
+-   **title** - The movie title
+-   **genres** - The genres associated with the movie
+
+```{r Exploring the Dataset}
+head(edx)
+```
+
+The following sections will guide you threw Data Exploration, Modelbuilding and validation and a Conclusion.
+
+\newpage{}
+
+# Analysis
+
+## Exploratory Data Analysis
+
+Because of the size of the dataset, extensive data wrangling/exploration and standard algorithms like the *lm* are not possible on this dataset due to the immense computing time this would need on most machines. However we can draw some assumptions to build a linear model.
+
+
+-   **rating**
+
+Before we begin with the analysis we have to understand the value we are trying to predict. Therefore we can take a look at the mean (`r mean(edx$rating)`) and the histogram of the ratings.
+
+```{r ratings histogram, out.width='75%', fig.cap="Ratings"}
+hist(edx$rating, main = NULL, xlab = NULL)
+```
+
+As you can see in Figure 1 the ratings in the dataset are not centered. The Distribution shows that there are more positive ratings ($\geq$ 3) than  rather negative ratings (< 3).
+
+-   **userId & movieId**
+
+```{r mutate movies, include=FALSE}
+tmp_ratings <- edx %>% group_by(movieId) %>% summarise(n()) %>% filter(.$`n()` <= 15)
+edx <- anti_join(edx, tmp_ratings)
+```
+
+There are `r nrow(edx %>% count(movieId))` different Movies in the dataset. However there are `r nrow(tmp_ratings)` movies in the dataset which are rated 15 times or even less. These ratings are not really helpful to our analysis as they introduce more variability.
+
+```{r rm tmp, include=FALSE}
+rm(tmp_ratings)
+```
+
+Having removed these ratings there are now `r nrow(edx)` ratings left.
+
+As there are `r nrow(edx %>% count(movieId))` different Movies in the dataset, but just `r nrow(edx %>% count(userId))` users suggests that not every user has rated every movie. You can simply explain that if you multiply those two together you get `r nrow(edx %>% count(movieId)) * nrow(edx %>% count(userId))` < `r nrow(edx)`, which is the number of observations recorded in the dataset.
+
+-   **timestamp**
+
+A Timestamp is representing the seconds elapsed since January 01, 1970 UTC [[2]](https://en.wikipedia.org/wiki/Unix_time). This means we can convert the timestamp to the specific date of the submission.
+
+```{r mutate date}
+edx <- edx %>% mutate(date = as_date(as_datetime(timestamp)))
+
+edx %>% select(movieId, userId, timestamp, date) %>% head()
+
+```
+
+-   **genres**
+
+According to Dataset documentation [[3]](https://files.grouplens.org/datasets/movielens/ml-10m-README.html), there are 18 genres available to be assigned to a movie:
+
+```{r genre count, cache=TRUE}
+genres <- c("Action", "Adventure", "Animation", "Children", "Comedy", "Crime", "Documentary", "Drama", "Fantasy", "Film-Noir", "Horror", "Musical", "Mystery", "Romance", "Sci-Fi", "Thriller", "War", "Western")
+
+list <- list()
+for (genre in genres) {
+  list[[genre]] <- sum(str_detect(edx$genres, genre))
+}
+pivot_longer(as.data.frame(list), everything(), names_to = "genre", values_to = "count")
+rm(list, genres, genre)
+```
+
+As you can see not all Genres are equally represented.
+
+## RMSE
+
+The Root Mean Squared Error is defined as follows: $$ RMSE = \sqrt{\frac{1}{n}\sum_{k=1}^{n}(\hat{y}_k-y_k)^2}$$
+
+where $\hat{y}$ are the actual and *y* are the predicted values. More information [[4]](https://en.wikipedia.org/wiki/Root_mean_square_deviation).
+
+In code it is calculated like this:
+
+```{r rmse, echo=TRUE}
+rmse <- function(y_actual, y_predicted) { 
+  sqrt(mean((y_actual - y_predicted)^2)) 
+}
+```
+
+## Train /Test set
+
+```{r dimentions, cache=TRUE, include=FALSE}
+set.seed(1234, sample.kind = "Rounding")
+index <- createDataPartition(y = edx$rating, p = 0.25, list = FALSE)
+edx_train <- edx[-index,]
+edx_test <- edx[index,]
+rm(index)
+```
+
+In order to train our Algorithm and validate its accuracy, we will split the edx dataset in:
+
+-   **Training set** - will be used to train the algorithm *(75%, `r nrow(edx_train)` observations)*
+-   **Test set** - will be used to validate the algorithms accuracy *(25%, `r nrow(edx_test)` observations)*
+
+## Modelbuilding
+
+The attempts used in this section (2.4) are linear models to predict the ratings presented by **Rafael A. Irizarry** in his book *Introduction to Data Science* [[5]](http://rafalab.dfci.harvard.edu/dsbook/). However we are trying to extend on this ideas in a later section (2.5).
+
+### Trivial Model
+
+```{r trivial model}
+mu <- mean(edx_train$rating)
+
+rmse_trivial <- rmse(edx_test$rating, mu)
+```
+
+The most basic model we can think of is predicting the rating as just the mean. $$ y_{predicted} = \mu \quad \text{where} \quad \mu = \frac{1}{n}\sum_{k=1}^{n}{\hat{y}_{k}} \quad \quad \hat{y}\text{ are the actual values}$$ So, using this model by prediction the rating with just the mean $\mu$ of the actual ratings ($\mu$ = `r mu`), we get:
+
+```{r trivail output}
+results <- tibble(Model = "Trivial Model", RMSE = rmse_trivial, Goal = rmse_trivial < goal_rmse)
+results
+```
+
+This should be seen as a sort of benchmark because it is the most basic we can get and we are far away from our goal.
+
+### Movie Effect
+
+```{r movie model}
+movie_effect <- edx_train %>% group_by(movieId) %>% summarise(b_i = mean(rating - mu))
+
+fit_movies <- edx_test %>% 
+  left_join(movie_effect, by = "movieId") %>% 
+  mutate( predict = mu + b_i) %>% 
+  pull(predict)
+
+fit_movies <- if_else(is.na(fit_movies), mu, fit_movies)
+
+rmse_movie <- rmse(edx_test$rating, fit_movies)
+```
+
+However as indicated earlier some movies (e.g. Blockbusters) are just higher rated then other movies. So to improve our model and to compensate for this effect, we adjust our model like this: $$y_{predicted} = \mu + b_i \quad \text{where} \quad b_i = \frac{1}{n}\sum{\hat{y}_i - \mu} \quad \quad \hat{y}\text{ are the actual values}$$
+
+```{r movie output}
+results <- bind_rows(results, tibble(Model = "Movie Effect", RMSE = rmse_movie, Goal = rmse_movie < goal_rmse))
+results
+```
+
+You can see that this has improved our model quite a bit, but still not good enough.
+
+### User Effect
+```{r user model}
+user_effect <- edx_train %>% 
+  left_join(movie_effect, by = "movieId") %>% 
+  group_by(userId) %>% 
+  summarise(b_u = mean(rating - mu - b_i))
+
+fit_users <- edx_test %>% 
+  left_join(movie_effect, by = "movieId") %>% 
+  left_join(user_effect, by = "userId") %>% 
+  mutate(predict = mu + b_i + b_u) %>% 
+  pull(predict)
+
+fit_users <- if_else(is.na(fit_users), mu, fit_users)
+
+rmse_movie_users <- rmse(edx_test$rating, fit_users)
+```
+
+As with movies, it is understandable that not all users rate films the same way. Some may be more critical, others more enthusiastic. So we adjust out model like this: $$y_{predicted} = \mu + b_i + b_u \quad \text{where} \quad b_u = \frac{1}{n}\sum{\hat{y}_{u,i} - \mu - b_i} \quad \quad \hat{y}\text{ are the actual values}$$
+
+```{r user output}
+results <- bind_rows(results, tibble(Model = "Movie + User Effect", RMSE = rmse_movie_users, Goal = rmse_movie_users < goal_rmse))
+results
+```
+
+We were able to reduce the RMSE again quite substantially but to reach our goal we still have to improve it.
+
+### Movie & User Regularization
+
+As User & Movie Effect was quite an improvement to our RMSE, we can do some more with a technique called Regularization.
+With Regularization we are trying to reduce the impact of insignificant observations, like we did before when removing the less rated movies. But there is still some room for improvement.
+
+```{r regularization model, warning=FALSE, cache = TRUE, out.width='60%', fig.cap='Minimizing Lambda'}
+lambdas <- seq(0, 7, 0.1)
+
+rmse_coll <- sapply(lambdas, function(lambda) {
+  b_i_reg <- edx_train %>% 
+    group_by(movieId) %>% 
+    summarise(b_i_reg = sum(rating - mu) / (n() + lambda))
+  
+  b_u_reg <- edx_train %>% 
+  left_join(b_i_reg, by = "movieId") %>% 
+  group_by(userId) %>% 
+  summarise(b_u_reg = sum(rating - mu - b_i_reg) / (n() + lambda))
+  
+edx_test %>% 
+    left_join(b_i_reg, by = "movieId") %>%
+    left_join(b_u_reg, by = "userId") %>%
+    mutate(predict = mu + b_i_reg + b_u_reg) %>%
+    filter(!is.na(predict)) %>%
+    #mutate(predict = if_else(is.na(predict), mean(predict, na.rm = TRUE), predict)) %>%
+    summarise(rmse = rmse(rating, predict)) %>%
+    pull(rmse)
+})
+
+lambda <- lambdas[which.min(rmse_coll)]
+qplot(lambdas, rmse_coll, geom = "line", main = NULL, xlab = "Lambda", ylab = "RMSE")
+```
+After using cross validation we see that $\lambda$ = `r lambda` minimizes the RMSE. Using the selected $\lambda$ we can take a look at the RMSE. 
+
+```{r regularization output}
+results <- bind_rows(results, tibble(Model = "Regularization", RMSE = min(rmse_coll), Goal = min(rmse_coll) < goal_rmse))
+results
+```
+
+This improved the RMSE again by a small amount, but we still have room for improvement.
+
+## Extending the Model
+
+### Matrix Factorization
+However up to this point our models were provided by our Instructor **Rafael A. Irizarry** in the course materials and in his book [[5]](http://rafalab.dfci.harvard.edu/dsbook/). But in order to reach our goal we must go a step further. To further enhance our predictions we turn to a concept called **Matrix Factorization**.
+
+Matrix Factorization is an algorithm that constructs two matrices by decomposing an matrix called the user-interaction-matrix[[6]](https://en.wikipedia.org/wiki/Matrix_factorization_(recommender_systems)).
+
+In our example the user-interaction-Matrix is constructed by the ratings, userId and the movieId columns.
+
+```{r mf_setup, message=FALSE, warning=FALSE}
+set.seed(123, sample.kind = "Rounding")
+train_data <- data_memory(user_index = edx_train$userId, item_index = edx_train$movieId, rating = edx_train$rating)
+test_data <- data_memory(user_index = edx_test$userId, item_index = edx_test$movieId)
+
+r <- Reco()
+```
+
+We will use a built-in function to find the best tune options for the algorithm:
+
+```{r mf_opts, cache=TRUE}
+opts <- r$tune(train_data,opts = list(dim = c(20, 30, 40), lrate = c(0.1, 0.2), costp_l1 = 0, costq_l1 = 0, nthread = 1, niter = 10))
+
+kable(as.data.frame(opts$min))
+
+```
+
+Using these Parameters we are training our Matrix factorization algorithm.
+
+```{r mf, message=FALSE, warning=FALSE, cache=TRUE, include=FALSE}
+
+r$train(train_data, opts = c(opts$min, nthread = 1, niter = 10))
+
+pred_mf = r$predict(test_data, out_memory())
+
+rmse_mf <- rmse(pred_mf, edx_test$rating)
+```
+
+```{r mf_out}
+results <- bind_rows(results, tibble(Model = "Matrix Factorization", RMSE = rmse_mf, Goal = rmse_mf < goal_rmse))
+results
+```
+
+We are able to reach our goal with an RMSE of `r rmse_mf` using Matrix factorization on our test set.
+
+\newpage{}
+
+# Results
+
+```{r present results, echo=FALSE}
+kable(results)
+```
+
+As you can see above we have reached our goal using the Matrix Factorization technique. To validate our result and fulfill the course objective we are validating the result using the *final_holdout_set* mentioned at the beginning.
+```{r final, cache=TRUE}
+
+final_data <- data_memory(user_index = final_holdout_test$userId, item_index = final_holdout_test$movieId)
+pred_final = r$predict(final_data, out_memory())
+
+rmse_final <- rmse(pred_final, final_holdout_test$rating)
+
+kable(tibble(Model = "Matrix Factorization - Final", RMSE = rmse_final))
+```
+
+As you can see the Algorithm does perform with quite simmilar accuracy on the test and the final_holdout set.
+
+# Conclusion
+
+Our goal in this project was to train an algorithm that could predict Movieratings using the MovieLens 10M[1] Dataset. We explored the dataset and constructed different linear models to make more accurate predictions. As our final model we use the Matrix Factorization algorithm, as it could make the most accurate predictions.
+
+There is however still room for improvement. Future work could address more extensive data exploration, data preprocessing and optimizing the algorithm parameters.
+
+\newpage{}
+
+# References
+
+[[1]](https://grouplens.org/datasets/movielens/10m/) : <https://grouplens.org/datasets/movielens/10m/>
+
+[[2]](https://en.wikipedia.org/wiki/Unix_time) : **Wikipedia contributors** (2024, October 5) *Unix time* In Wikipedia, The Free Encyclopedia. Available at: <https://en.wikipedia.org/wiki/Unix_time> (Last Accessed: 09 October 2024).
+
+[[3]](https://files.grouplens.org/datasets/movielens/ml-10m-README.html) : **GroupLens** (no date), *MovieLens 10M/100k Data Set README* Available at: <https://files.grouplens.org/datasets/movielens/ml-10m-README.html> (Last Accessed: 10 October 2024).
+
+[[4]](https://en.wikipedia.org/wiki/Root_mean_square_deviation): **Wikipedia contributors** (2024, October 10) *Root mean square deviation* In Wikipedia, The Free Encyclopedia. Available at: <https://en.wikipedia.org/wiki/Root_mean_square_deviation> (Last Accessed: 10 October 2024).
+
+[[5]](http://rafalab.dfci.harvard.edu/dsbook/) : **Irizarry, R.A.** (no date) 2024-05–16th edn, *Introduction to Data Science*. 2024-05–16th edn. Available at: <http://rafalab.dfci.harvard.edu/dsbook/> (Last Accessed: 09 October 2024). 
+
+[[6]](https://en.wikipedia.org/wiki/Matrix_factorization_(recommender_systems)) : **WIkipedia contributors** (2024, August 23) *Matrix factorization (recommender systems)* In Wikipedia, The Free Encyclopedia. Available at: <https://en.wikipedia.org/wiki/Matrix_factorization_(recommender_systems)> (Last Accessed: 09 October 2024).
